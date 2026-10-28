@@ -1,0 +1,395 @@
+// Copyright 2000-2026 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
+package org.jetbrains.idea.perforce.application;
+
+import com.intellij.openapi.Disposable;
+import com.intellij.openapi.application.Application;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.components.Service;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Comparing;
+import com.intellij.openapi.util.Computable;
+import com.intellij.openapi.util.Disposer;
+import com.intellij.openapi.util.io.FileUtil;
+import com.intellij.openapi.vcs.VcsException;
+import com.intellij.openapi.vcs.changes.VcsDirtyScopeManager;
+import com.intellij.openapi.vfs.LocalFileSystem;
+import com.intellij.openapi.vfs.VfsUtilCore;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.openapi.vfs.VirtualFileEvent;
+import com.intellij.openapi.vfs.VirtualFileListener;
+import com.intellij.openapi.vfs.VirtualFileManager;
+import com.intellij.openapi.vfs.VirtualFilePropertyEvent;
+import com.intellij.util.containers.ContainerUtil;
+import org.jetbrains.annotations.Contract;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.idea.perforce.ClientVersion;
+import org.jetbrains.idea.perforce.PerforceBundle;
+import org.jetbrains.idea.perforce.ServerVersion;
+import org.jetbrains.idea.perforce.perforce.OutputMessageParser;
+import org.jetbrains.idea.perforce.perforce.P4Command;
+import org.jetbrains.idea.perforce.perforce.P4File;
+import org.jetbrains.idea.perforce.perforce.PerforceRunner;
+import org.jetbrains.idea.perforce.perforce.PerforceSettings;
+import org.jetbrains.idea.perforce.perforce.View;
+import org.jetbrains.idea.perforce.perforce.connections.P4Connection;
+import org.jetbrains.idea.perforce.perforce.connections.PerforceConnectionManager;
+import org.jetbrains.idea.perforce.perforce.login.PerforceLoginManager;
+import org.jetbrains.idea.perforce.util.tracer.LongCallsParameters;
+import org.jetbrains.idea.perforce.util.tracer.TracerManager;
+import org.jetbrains.idea.perforce.util.tracer.TracerParameters;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+
+@Service(Service.Level.PROJECT)
+public final class PerforceManager  {
+  private final Project myProject;
+  private final PerforceLoginManager myLoginManager;
+
+  private static final Logger LOG = Logger.getInstance(PerforceManager.class);
+  private static final Logger LOG_RELATIVE_PATH = Logger.getInstance("#Log_relative_path");
+  private static final Logger TRACER_LOG = Logger.getInstance("#org.jetbrains.idea.perforce.application.PerforceManager_TRACER");
+
+  private final Map<P4Connection, PerforceClient> myClientMap = new HashMap<>();
+
+  private static final boolean ourTraceCalls = Boolean.getBoolean("perforce.trace.calls");
+  private static final String ourTracerProperties = System.getProperty("perforce.trace.calls.properties");
+  private TracerManager<P4Command> myTracer;
+
+  private final ClientRootsCache myClientRootsCache;
+  private final PerforceBaseInfoWorker myPerforceBaseInfoWorker;
+
+  private final VirtualFileListener myListener;
+
+  private volatile ClientVersion myClientVersion;
+  private volatile boolean myActive;
+  private final LocalFileSystem myLfs;
+  private final PerforceShelf myShelf;
+
+  public static PerforceManager getInstance(Project project) {
+    return project.getService(PerforceManager.class);
+  }
+
+  public PerforceManager(@NotNull Project project) {
+    myProject = project;
+    myLoginManager = PerforceLoginManager.getInstance(project);
+    myListener = new VirtualFileListener() {
+      @Override
+      public void propertyChanged(@NotNull VirtualFilePropertyEvent event) {
+        if (!event.isFromRefresh()) return;
+        if (event.getPropertyName().equals(VirtualFile.PROP_WRITABLE)) {
+          final boolean wasWritable = ((Boolean)event.getOldValue()).booleanValue();
+          if (wasWritable) {
+            event.getFile().putUserData(P4File.KEY, null);
+          }
+        }
+      }
+
+      @Override
+      public void contentsChanged(@NotNull VirtualFileEvent event) {
+        if (!event.isFromRefresh()) return;
+        if (!event.getFile().isWritable()) {
+          event.getFile().putUserData(P4File.KEY, null);
+        }
+      }
+    };
+
+    myClientRootsCache = ClientRootsCache.getClientRootsCache(project);
+    myPerforceBaseInfoWorker = project.getService(PerforceBaseInfoWorker.class);
+    if (ourTraceCalls) {
+      myTracer = createTracer();
+    }
+    myLfs = LocalFileSystem.getInstance();
+    myShelf = new PerforceShelf(project);
+  }
+
+  private static TracerManager<P4Command> createTracer() {
+    if (ourTracerProperties != null) {
+      final Properties properties = new Properties();
+      try {
+        properties.load(new FileInputStream(ourTracerProperties));
+
+        final boolean logAverageTimes = Boolean.parseBoolean(properties.getProperty(TracerProperties.GATHER_AVERAGE_TIMES));
+        final TracerParameters averageParameters;
+        if (logAverageTimes) {
+          averageParameters = new TracerParameters(TracerProperties.averageTimesInterval.getValue(properties),
+                                                   (int) TracerProperties.averageTimesQueueSize.getValue(properties));
+        } else {
+          averageParameters = null;
+        }
+        final boolean logConcurrentThreads = Boolean.parseBoolean(properties.getProperty(TracerProperties.GATHER_CONCURRENT_THREADS));
+        final TracerParameters concurrentThreadsParameters;
+        if (logConcurrentThreads) {
+          concurrentThreadsParameters = new TracerParameters(TracerProperties.numberConcurrentThreadsInterval.getValue(properties),
+                                                             (int) TracerProperties.numberConcurrentThreadsQueueSize.getValue(properties));
+        } else {
+          concurrentThreadsParameters = null;
+        }
+        final boolean logLongCalls = Boolean.parseBoolean(properties.getProperty(TracerProperties.GATHER_LONG_CALLS));
+        final LongCallsParameters longCallsParameters;
+        if (logLongCalls) {
+          longCallsParameters = new LongCallsParameters(TracerProperties.longCallsInterval.getValue(properties),
+                                                        (int) TracerProperties.longCallsQueueSize.getValue(properties),
+                                                        (int) TracerProperties.longCallsMaxKept.getValue(properties),
+                                                        TracerProperties.longCallsLowerBound.getValue(properties));
+        } else {
+          longCallsParameters = null;
+        }
+        return new TracerManager<>(averageParameters, concurrentThreadsParameters, longCallsParameters, TRACER_LOG,
+                                   TracerProperties.outputInterval.getValue(properties));
+      }
+      catch (IOException e) {
+        //
+      }
+    }
+    return new TracerManager<>(new TracerParameters(TracerProperties.averageTimesInterval.getDefault(),
+                                                    (int)TracerProperties.averageTimesQueueSize.getDefault()),
+                               new TracerParameters(TracerProperties.numberConcurrentThreadsInterval.getDefault(),
+                                                    (int)TracerProperties.numberConcurrentThreadsQueueSize.getDefault()),
+                               new LongCallsParameters(TracerProperties.longCallsInterval.getDefault(),
+                                                       (int)TracerProperties.longCallsQueueSize.getDefault(),
+                                                       (int)TracerProperties.longCallsMaxKept.getDefault(),
+                                                       TracerProperties.longCallsLowerBound.getDefault()),
+                               TRACER_LOG, TracerProperties.outputInterval.getDefault());
+  }
+
+  public @Nullable ClientVersion getClientVersion() {
+    ClientVersion version = myClientVersion;
+    if (version == null) {
+      myClientVersion = version = PerforceRunner.getInstance(myProject).getClientVersion();
+    }
+    return version;
+  }
+
+  public void startListening(@NotNull Disposable parentDisposable) {
+    myActive = true;
+    VirtualFileManager.getInstance().addVirtualFileListener(myListener, parentDisposable);
+    myLoginManager.startListening(parentDisposable);
+    myPerforceBaseInfoWorker.start();
+
+    Disposer.register(parentDisposable, () -> {
+      myActive = false;
+      myPerforceBaseInfoWorker.stop();
+    });
+  }
+
+  @NotNull Map<String, List<String>> getCachedInfo(P4Connection connection) throws VcsException {
+    final Map<String, List<String>> info = myPerforceBaseInfoWorker.getInfo(connection);
+    if (info == null) {
+      ProgressManager.checkCanceled();
+      throw new VcsException(PerforceBundle.message("error.info.is.not.available"));
+    }
+    return info;
+  }
+
+  @NotNull ClientData getCachedClients(@Nullable P4Connection connection) throws VcsException {
+    ClientData client = myPerforceBaseInfoWorker.getClient(connection);
+    if (client == null) {
+      ProgressManager.checkCanceled();
+      throw new VcsException(PerforceBundle.message("error.info.is.not.available"));
+    }
+    return client;
+  }
+
+  private @Nullable Map<String, List<String>> getInfoOnlyCached(final P4Connection connection) throws VcsException {
+    return myPerforceBaseInfoWorker.getCachedInfo(connection);
+  }
+
+  @Nullable ClientData getClientOnlyCached(final P4Connection connection) throws VcsException {
+    return myPerforceBaseInfoWorker.getCachedClient(connection);
+  }
+
+  // todo: wrong. we should take all roots, since we can belong to any
+  public @Nullable String getClientRoot(final @Nullable P4Connection connection) throws VcsException {
+    return ContainerUtil.getFirstItem(getClientRoots(connection));
+  }
+
+  public @NotNull List<String> getClientRoots(@Nullable P4Connection connection) throws VcsException {
+    return ContainerUtil.filter(getCachedClients(connection).getAllRoots(), mainRootValue -> {
+      File file = new File(mainRootValue);
+      VirtualFile vf = myLfs.findFileByIoFile(file);
+      return vf != null && vf.isDirectory() || PerforceClientRootsChecker.isDirectory(file);
+    });
+  }
+
+  public long getServerVersionYear(final @Nullable P4Connection connection) throws VcsException {
+    final Map<String, List<String>> map = getCachedInfo(connection);
+    final List<String> serverVersions = map.get(PerforceRunner.SERVER_VERSION);
+    if (serverVersions == null || serverVersions.isEmpty()) return -1;
+    return OutputMessageParser.parseServerVersion(serverVersions.get(0)).getVersionYear();
+  }
+
+  public long getServerVersionYearCached(final @Nullable P4Connection connection) throws VcsException {
+    final Map<String, List<String>> map = getInfoOnlyCached(connection);
+    if (map == null) return -1;
+    final List<String> serverVersions = map.get(PerforceRunner.SERVER_VERSION);
+    if (serverVersions == null || serverVersions.isEmpty()) return -1;
+    return OutputMessageParser.parseServerVersion(serverVersions.get(0)).getVersionYear();
+  }
+
+  public @Nullable ServerVersion getServerVersion(final @Nullable P4Connection connection) throws VcsException {
+    final List<String> serverVersions = getCachedInfo(connection).get(PerforceRunner.SERVER_VERSION);
+    if (serverVersions == null || serverVersions.isEmpty()) return null;
+    return OutputMessageParser.parseServerVersion(serverVersions.get(0));
+  }
+
+  public boolean isUnderPerforceRoot(final @NotNull VirtualFile virtualFile) throws VcsException {
+    final P4Connection connection = PerforceSettings.getSettings(myProject).getConnectionForFile(virtualFile);
+    return getClientRoots(connection).stream().anyMatch(path -> isUnderClientRoot(virtualFile, path));
+  }
+
+  private boolean isUnderClientRoot(final VirtualFile virtualFile, final String path) {
+    final Application application = ApplicationManager.getApplication();
+    return application.runReadAction((Computable<Boolean>)() -> {
+      final VirtualFile root = myLfs.findFileByIoFile(new File(path));
+      if (root != null && ((Comparing.equal(root, virtualFile)) || VfsUtilCore.isAncestor(root, virtualFile, false))) {
+        return true;
+      }
+      return false;
+    });
+  }
+
+  private static @Nullable String getRelativePath(String filePath, PerforceClient client) throws VcsException {
+    return View.getRelativePath(P4File.unescapeWildcards(filePath), client.getName(), client.getViews());
+  }
+
+  public static @Nullable File getFileByDepotName(@NotNull String depotPath, @NotNull PerforceClient client) throws VcsException {
+
+    int revNumStart = depotPath.indexOf("#");
+
+    final String relativePath;
+
+    if (revNumStart >= 0) {
+      relativePath = getRelativePath(depotPath.substring(0, revNumStart), client);
+
+    }
+    else {
+      relativePath = getRelativePath(depotPath, client);
+    }
+
+    if (relativePath == null)  {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(missingLocalFileDiagnostics(depotPath, client));
+      }
+
+      return null;
+    }
+
+    Project project = client.getProject();
+    List<String> roots = client.getRoots();
+    List<File> resultCandidates = roots.isEmpty() ? Collections.singletonList(new File(FileUtil.toSystemDependentName(relativePath.trim())))
+                                                  : ContainerUtil.map(roots, clientRoot -> new File(clientRoot, relativePath.trim()));
+
+    File resultInProject = ContainerUtil.find(resultCandidates, result -> project == null ||
+                                                                          PerforceConnectionManager.getInstance(project)
+                                                                            .isUnderProjectConnections(result));
+    if (LOG_RELATIVE_PATH.isDebugEnabled()) {
+      LOG_RELATIVE_PATH.debug(
+        "depot: '" + depotPath + "' result: '" + resultInProject + "'" + (resultInProject == null ? " checked " + resultCandidates : ""));
+    }
+
+    return resultInProject;
+  }
+
+  private static String missingLocalFileDiagnostics(String depotPath, PerforceClient client) throws VcsException {
+    final StringBuilder message = new StringBuilder();
+    for (View view : client.getViews()) {
+      message.append('\n');
+      message.append("View ");
+      message.append(view.toString());
+    }
+    message.append('\n');
+    message.append("Cannot find local file for depot path: ").append(depotPath);
+    return message.toString();
+  }
+
+  public synchronized @NotNull PerforceClient getClient(final @NotNull P4Connection connection) {
+    PerforceClient client = myClientMap.get(connection);
+    if (client == null) {
+      client = new PerforceClientImpl(myProject, connection);
+      myClientMap.put(connection, client);
+    }
+    return client;
+  }
+
+  public void configurationChanged() {
+    //noinspection SynchronizeOnThis
+    synchronized (this) {
+      myClientMap.clear();
+    }
+
+    if (! myActive) return;
+    myLoginManager.clearAll();
+    clearInfoClientCache();
+    ApplicationManager.getApplication().invokeLater(() -> {
+      P4File.invalidateFstat(myProject);
+      VcsDirtyScopeManager.getInstance(myProject).markEverythingDirty();
+    }, myProject.getDisposed());
+  }
+
+  public void clearInfoClientCache() {
+    myPerforceBaseInfoWorker.scheduleRefresh();
+  }
+
+  @Contract("null->null; !null->!null")
+  public @Nullable String getRawRoot(final @Nullable String convertedRoot) {
+    return myClientRootsCache.getRaw(convertedRoot);
+  }
+
+  public @NotNull String convertP4ParsedPath(@Nullable String convertedClientRoot, @NotNull String s) {
+    String result = myClientRootsCache.convertPath(convertedClientRoot, s);
+    LOG_RELATIVE_PATH.debug("convertion, s: '" + s + "' converted: '" + result + "' convertedRoot: '" + convertedClientRoot + "'");
+    return result;
+  }
+
+  public @Nullable Object traceEnter(final P4Command command, final String commandPresentation) {
+    if (myTracer != null) {
+      return myTracer.start(command, commandPresentation);
+    }
+    return null;
+  }
+
+  public void traceExit(final Object context, final P4Command command, final String commandPresentation) {
+    if (myTracer != null) {
+      myTracer.stop(context, command, commandPresentation);
+    }
+  }
+
+  public boolean isTraceEnabled() {
+    return ourTraceCalls;
+  }
+
+  public void resetClientVersion() {
+    myClientVersion = null;
+  }
+
+  public boolean isActive() {
+    return myActive;
+  }
+
+  public static void ensureValidClient(@NotNull Project project, @NotNull P4Connection connection) throws VcsException {
+    PerforceClient client = getInstance(project).getClient(connection);
+    if (client.getName() == null) {
+      throw new VcsException(PerforceBundle.message("error.missing.perforce.workspace"));
+    }
+    if (client.getUserName() == null) {
+      throw new VcsException(PerforceBundle.message("error.missing.perforce.user.name"));
+    }
+    if (client.getServerPort() == null) {
+      throw new VcsException(PerforceBundle.message("error.missing.perforce.server.port"));
+    }
+  }
+
+  public PerforceShelf getShelf() {
+    return myShelf;
+  }
+}

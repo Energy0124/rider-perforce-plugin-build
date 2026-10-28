@@ -1,0 +1,92 @@
+diff --git a/PerforceIntegration/build.gradle.kts b/PerforceIntegration/build.gradle.kts
+index 8304fed..995d69a 100644
+--- a/PerforceIntegration/build.gradle.kts
++++ b/PerforceIntegration/build.gradle.kts
+@@ -19,6 +19,8 @@ repositories {
+ }
+ 
+ intellijPlatform {
++  instrumentCode = false
++  buildSearchableOptions = false
+   pluginConfiguration {
+     name = "Perforce"
+   }
+@@ -45,10 +47,19 @@ sourceSets {
+ 
+ dependencies {
+   intellijPlatform {
+-    bundledModules("intellij.platform.vcs.impl")
++    bundledModules(
++      "intellij.platform.vcs",
++      "intellij.platform.vcs.core",
++      "intellij.platform.vcs.dvcs",
++      "intellij.platform.vcs.dvcs.impl",
++      "intellij.platform.vcs.dvcs.impl.shared",
++      "intellij.platform.vcs.impl",
++      "intellij.platform.vcs.impl.shared",
++      "intellij.platform.vcs.shared",
++    )
+     bundledPlugins("Git4Idea")
+     jetbrainsRuntime()
+-    intellijIdeaUltimate(ext("platform.version"), useInstaller = false)
++    intellijIdea(ext("platform.version")) { useInstaller = false }
+     platformDependency(Coordinates("com.jetbrains.intellij.platform", "vcs-test-framework"))
+     testFramework(TestFrameworkType.Platform)
+     testFramework(TestFrameworkType.Bundled)
+diff --git a/PerforceIntegration/perforce_util/build.gradle.kts b/PerforceIntegration/perforce_util/build.gradle.kts
+index 72544b3..a21d544 100644
+--- a/PerforceIntegration/perforce_util/build.gradle.kts
++++ b/PerforceIntegration/perforce_util/build.gradle.kts
+@@ -32,7 +32,7 @@ sourceSets {
+ dependencies {
+   intellijPlatform {
+     jetbrainsRuntime()
+-    intellijIdeaUltimate(ext("platform.version"), useInstaller = false)
++    intellijIdea(ext("platform.version")) { useInstaller = false }
+   }
+ }
+ 
+diff --git a/contrib-configuration/common.gradle.kts b/contrib-configuration/common.gradle.kts
+index dd4b480..2a3739b 100644
+--- a/contrib-configuration/common.gradle.kts
++++ b/contrib-configuration/common.gradle.kts
+@@ -3,14 +3,14 @@ repositories {
+   maven("https://oss.sonatype.org/content/repositories/snapshots/")
+ }
+ 
+-rootProject.extensions.add("platform.version", "LATEST-EAP-SNAPSHOT")
++rootProject.extensions.add("platform.version", "2026.2.3")
+ 
+-rootProject.extensions.add("gradle.version", "8.14.3")
++rootProject.extensions.add("gradle.version", "9.4.1")
+ 
+ rootProject.extensions.add("junit.version", "4.13.2")
+ 
+-rootProject.extensions.add("kotlin.jvmTarget", "21")
++rootProject.extensions.add("kotlin.jvmTarget", "25")
+ rootProject.extensions.add("kotlin.freeCompilerArgs", listOf("-Xjvm-default=all"))
+ 
+-rootProject.extensions.add("java.sourceCompatibility", "21")
+-rootProject.extensions.add("java.targetCompatibility", "21")
+\ No newline at end of file
++rootProject.extensions.add("java.sourceCompatibility", "25")
++rootProject.extensions.add("java.targetCompatibility", "25")
+diff --git a/contrib-configuration/settings.gradle.kts b/contrib-configuration/settings.gradle.kts
+index 7966792..c24be2c 100644
+--- a/contrib-configuration/settings.gradle.kts
++++ b/contrib-configuration/settings.gradle.kts
+@@ -13,9 +13,9 @@ buildscript {
+     }
+     plugins {
+       id("java")
+-      id("org.jetbrains.kotlin.jvm") version "2.2.20"
+-      id("org.jetbrains.intellij.platform") version "2.9.0"
+-      id("org.jetbrains.intellij.platform.settings") version "2.9.0"
++      id("org.jetbrains.kotlin.jvm") version "2.4.21"
++      id("org.jetbrains.intellij.platform") version "2.19.0"
++      id("org.jetbrains.intellij.platform.settings") version "2.19.0"
+     }
+   }
+-}
+\ No newline at end of file
++}

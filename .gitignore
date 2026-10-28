@@ -1,0 +1,8 @@
+.gradle/
+**/.gradle/
+**/build/
+**/.intellijPlatform/
+**/.idea/
+platform/
+tools/
+*.log
